@@ -238,6 +238,30 @@ pub const Conn = struct {
         return stmt;
     }
 
+    pub fn prepareCached(self: *Conn, sql: []const u8, cache_name: []const u8) !void {
+        if (self._prepared_statements.contains(cache_name)) {
+            return;
+        }
+        var describe_arena = ArenaAllocator.init(self._allocator);
+        errdefer describe_arena.deinit();
+
+        var stmt = try Stmt.init(self, .{ .cache_name = cache_name });
+        errdefer stmt.deinit();
+        try stmt.prepare(sql, describe_arena.allocator());
+
+        const owned_name = try describe_arena.allocator().dupe(u8, cache_name);
+        try self._prepared_statements.put(self._allocator, owned_name, .{
+            .arena = describe_arena,
+            .param_oids = stmt.param_oids,
+            .result_state = stmt.result_state,
+        });
+        stmt.deinit();
+    }
+
+    pub fn getPreparedDescribe(self: *Conn, name: []const u8) ?*Stmt.Describe {
+        return self._prepared_statements.getPtr(name);
+    }
+
     pub fn query(self: *Conn, sql: []const u8, values: anytype) !*Result {
         return self.queryOpts(sql, values, .{});
     }
