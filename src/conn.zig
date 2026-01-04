@@ -199,6 +199,10 @@ pub const Conn = struct {
         self._prepared_statements.deinit(self._allocator);
     }
 
+    pub fn socketFd(self: *Conn) std.posix.socket_t {
+        return self._stream.socket;
+    }
+
     pub fn release(self: *Conn) void {
         var pool = self._pool orelse {
             self.deinit();
@@ -471,11 +475,49 @@ pub const Conn = struct {
         }
     }
 
+    pub fn readNonBlocking(self: *Conn) !lib.Message {
+        var reader = &self._reader;
+        while (true) {
+            const msg = reader.nextNonBlocking() catch |err| switch (err) {
+                error.WouldBlock => return error.WouldBlock,
+                else => {
+                    self._state = .fail;
+                    return err;
+                },
+            };
+            switch (msg.type) {
+                'Z' => {
+                    self._state = switch (msg.data[0]) {
+                        'I' => .idle,
+                        'T' => .transaction,
+                        'E' => .fail,
+                        else => unreachable,
+                    };
+                    return msg;
+                },
+                'S' => {},
+                'N' => {},
+                'E' => return self.setErr(msg.data),
+                else => return msg,
+            }
+        }
+    }
+
     pub fn write(self: *Conn, data: []const u8) !void {
         self._stream.writeAll(data) catch |err| {
             self._state = .fail;
             return err;
         };
+    }
+
+    pub fn writeNonBlocking(self: *Conn, data: []const u8) !usize {
+        const n = self._stream.writeNonBlocking(data) catch |err| {
+            if (err != error.WouldBlock) {
+                self._state = .fail;
+            }
+            return err;
+        };
+        return n;
     }
 
     fn setErr(self: *Conn, data: []const u8) error{ PG, OutOfMemory } {

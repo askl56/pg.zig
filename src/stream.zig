@@ -124,6 +124,40 @@ const TLSStream = struct {
 
         return readSocket(self.socket, buf);
     }
+
+    pub fn writeNonBlocking(self: *Stream, data: []const u8) !usize {
+        if (self.ssl) |ssl| {
+            var wrote_len: usize = 0;
+            const result = openssl.SSL_write_ex(ssl, data.ptr, @intCast(data.len), &wrote_len);
+            if (result <= 0) {
+                const err = openssl.SSL_get_error(ssl, result);
+                if (err == openssl.SSL_ERROR_WANT_READ or err == openssl.SSL_ERROR_WANT_WRITE) {
+                    return error.WouldBlock;
+                }
+                self.valid = false;
+                return error.SSLWriteFailed;
+            }
+            return wrote_len;
+        }
+        return writeSocketNonBlocking(self.socket, data);
+    }
+
+    pub fn readNonBlocking(self: *Stream, buf: []u8) !usize {
+        if (self.ssl) |ssl| {
+            var read_len: usize = 0;
+            const result = openssl.SSL_read_ex(ssl, buf.ptr, @intCast(buf.len), &read_len);
+            if (result <= 0) {
+                const err = openssl.SSL_get_error(ssl, result);
+                if (err == openssl.SSL_ERROR_WANT_READ or err == openssl.SSL_ERROR_WANT_WRITE) {
+                    return error.WouldBlock;
+                }
+                self.valid = false;
+                return error.SSLReadFailed;
+            }
+            return read_len;
+        }
+        return readSocketNonBlocking(self.socket, buf);
+    }
 };
 
 const PlainStream = struct {
@@ -159,6 +193,14 @@ const PlainStream = struct {
     pub fn read(self: *const PlainStream, buf: []u8) !usize {
         return readSocket(self.socket, buf);
     }
+
+    pub fn writeNonBlocking(self: *const PlainStream, data: []const u8) !usize {
+        return writeSocketNonBlocking(self.socket, data);
+    }
+
+    pub fn readNonBlocking(self: *const PlainStream, buf: []u8) !usize {
+        return readSocketNonBlocking(self.socket, buf);
+    }
 };
 
 fn readSocket(socket: posix.socket_t, buf: []u8) !usize {
@@ -176,6 +218,22 @@ fn writeSocket(socket: posix.socket_t, data: []const u8) !void {
     const w = &writer.interface;
     try w.writeAll(data);
     try w.flush();
+}
+
+fn readSocketNonBlocking(socket: posix.socket_t, buf: []u8) !usize {
+    const n = posix.read(socket, buf) catch |err| switch (err) {
+        error.WouldBlock => return error.WouldBlock,
+        else => return err,
+    };
+    return n;
+}
+
+fn writeSocketNonBlocking(socket: posix.socket_t, data: []const u8) !usize {
+    const n = posix.write(socket, data) catch |err| switch (err) {
+        error.WouldBlock => return error.WouldBlock,
+        else => return err,
+    };
+    return n;
 }
 
 fn isHostName(host: []const u8) bool {

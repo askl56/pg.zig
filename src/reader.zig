@@ -164,6 +164,10 @@ fn ReaderT(comptime T: type) type {
             return self.buffered(self.pos, false) orelse self.read(false);
         }
 
+        pub fn nextNonBlocking(self: *Self) !Message {
+            return self.buffered(self.pos, false) orelse self.readNonBlocking(false);
+        }
+
         fn read(self: *Self, error_peek: bool) !Message {
             var stream = self.stream;
             // const spare = buf.len - pos; // how much space we have left in our buffer
@@ -227,6 +231,66 @@ fn ReaderT(comptime T: type) type {
                 }
 
                 const n = try stream.read(buf[pos..]);
+                if (n == 0) {
+                    return error.Closed;
+                }
+                pos += n;
+                if (self.buffered(pos, error_peek)) |msg| {
+                    return msg;
+                }
+            }
+        }
+
+        fn readNonBlocking(self: *Self, error_peek: bool) !Message {
+            var stream = self.stream;
+            var buf = self.buf;
+            var pos = self.pos;
+            var message_length: usize = 0;
+
+            while (true) {
+                if (message_length == 0) {
+                    const start = self.start;
+                    const current_length = pos - start;
+
+                    if (current_length > 4) {
+                        message_length = std.mem.readInt(u32, buf[start + 1 .. start + 5][0..4], .big) + 1;
+
+                        if (message_length > buf.len) {
+                            var new_buf: []u8 = undefined;
+                            const allocator = self.allocator;
+
+                            if (buf.ptr == self.static.ptr) {
+                                new_buf = try allocator.alloc(u8, message_length);
+                                @memcpy(new_buf[0..current_length], buf[start..pos]);
+                                lib.metrics.allocReader(message_length);
+                            } else {
+                                new_buf = try allocator.realloc(buf, message_length);
+                                if (start > 0) {
+                                    std.mem.copyForwards(u8, new_buf[0..current_length], new_buf[start..pos]);
+                                }
+                                lib.metrics.allocReader(message_length - current_length);
+                            }
+
+                            self.start = 0;
+                            pos = current_length;
+                            buf = new_buf;
+                            self.buf = new_buf;
+                        } else if (message_length > buf.len - start) {
+                            std.mem.copyForwards(u8, buf[0..current_length], buf[start..pos]);
+                            pos = current_length;
+                            self.start = 0;
+                        }
+                    } else if (buf.len - start < 5) {
+                        std.mem.copyForwards(u8, buf[0..current_length], buf[start..pos]);
+                        pos = current_length;
+                        self.start = 0;
+                    }
+                }
+
+                const n = stream.readNonBlocking(buf[pos..]) catch |err| switch (err) {
+                    error.WouldBlock => return error.WouldBlock,
+                    else => return err,
+                };
                 if (n == 0) {
                     return error.Closed;
                 }
