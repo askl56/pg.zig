@@ -29,3 +29,6 @@ pub const CancelRequest = @import("proto/CancelRequest.zig");
 test {
     @import("std").testing.refAllDecls(@This());
 }
+
+pub const FunctionCall = @import("proto/FunctionCall.zig");
+pub const FunctionCallResponse = @import("proto/FunctionCallResponse.zig");

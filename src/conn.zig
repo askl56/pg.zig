@@ -703,6 +703,91 @@ pub const Conn = struct {
         return PipelineSession{ .conn = self, .allocator = self._allocator };
     }
 
+    pub fn fastCall(self: *Conn, oid: i32, args: anytype) !?[]const u8 {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        var buf = &self._buf;
+        buf.reset();
+
+        try self._reader.startFlow(self._allocator, null);
+        defer self._reader.endFlow() catch {};
+
+        // Build FunctionCall ('F')
+        const ArgsType = @TypeOf(args);
+        const args_info = @typeInfo(ArgsType);
+        if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
+            @compileError("args must be a tuple");
+        }
+        const fields = args_info.@"struct".fields;
+        const param_count = fields.len;
+
+        // Calculate payload length is hard because values are variable.
+        // We start with fixed header size and append.
+
+        buf.writeByteAssumeCapacity('F');
+        const len_pos = buf.len();
+        try buf.write(&.{ 0, 0, 0, 0 }); // len placeholder
+
+        try buf.writeIntBig(i32, oid);
+
+        // Formats: We use 1 format (binary) for all? Or explicit?
+        // Let's use explicit formats for each arg to be safe/correct with bindValue.
+        try buf.writeIntBig(u16, @intCast(param_count));
+        const formats_start = buf.len();
+        try buf.writeByteNTimes(0, param_count * 2); // placeholders
+
+        try buf.writeIntBig(u16, @intCast(param_count));
+
+        inline for (fields, 0..) |field, i| {
+            const format_pos = formats_start + (i * 2);
+            const type_oid = types.inferOid(field.type);
+            const val = @field(args, field.name);
+            try types.bindValue(field.type, type_oid, val, buf, format_pos);
+        }
+
+        try buf.writeIntBig(i16, 1); // Result format: Binary
+
+        // Patch length
+        const total_len = buf.len() - len_pos;
+        std.mem.writeInt(u32, buf.buf[len_pos..len_pos+4], @intCast(total_len), .big);
+
+        self._state = .query;
+        try self.write(buf.string());
+
+        var result_data: ?[]const u8 = null;
+
+        while (true) {
+            const msg = try self.read();
+            switch (msg.type) {
+                'V' => {
+                    const res = try proto.FunctionCallResponse.parse(msg.data);
+                    if (res.result) |val| {
+                        result_data = try self._allocator.dupe(u8, val);
+                    }
+                },
+                'Z' => {
+                    self._state = switch (msg.data[0]) {
+                        'I' => .idle,
+                        'T' => .transaction,
+                        'E' => .fail,
+                        else => unreachable,
+                    };
+                    return result_data;
+                },
+                'E' => return self.setErr(msg.data),
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
+    }
+
     pub fn copy(self: *Conn, sql: []const u8) !CopySession {
          if (self.canQuery() == false) {
             return error.ConnectionBusy;
@@ -1997,4 +2082,8 @@ test {
 
 test {
     _ = @import("../tests/test_pipeline.zig");
+}
+
+test {
+    _ = @import("../tests/test_large_object.zig");
 }

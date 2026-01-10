@@ -287,3 +287,5 @@ test "URI: invalid scheme" {
 test "URI: invalid params" {
     try std.testing.expectError(error.UnsupportedConnectionParam, parseOpts(try std.Uri.parse("postgresql:///?bar=baz"), std.testing.allocator));
 }
+
+pub const LargeObject = @import("large_object.zig").LargeObject;
