@@ -134,6 +134,221 @@ pub const Conn = struct {
         cache_name: ?[]const u8 = null,
     };
 
+    pub const PipelineSession = struct {
+        conn: *Conn,
+        allocator: Allocator,
+
+        pub fn query(self: *PipelineSession, sql: []const u8, args: anytype) !void {
+            const buf = &self.conn._buf;
+
+            // We use the unnamed statement ("") and unnamed portal ("").
+            // We need to infer OIDs for parameters.
+            const ArgsType = @TypeOf(args);
+            const args_info = @typeInfo(ArgsType);
+            if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
+                @compileError("args must be a tuple");
+            }
+
+            const fields = args_info.@"struct".fields;
+            const param_count = fields.len;
+
+            // 1. Parse ('P')
+            {
+                // len = 4 + name_len(0+1) + sql_len(N+1) + param_count(2) + param_oids(4*N)
+                const payload_len = 4 + 1 + sql.len + 1 + 2 + (param_count * 4);
+                try buf.ensureUnusedCapacity(1 + payload_len);
+                buf.writeByteAssumeCapacity('P');
+                buf.writeIntBigAssumeCapacity(u32, @intCast(payload_len));
+                buf.writeByteAssumeCapacity(0); // unnamed statement
+                buf.writeAssumeCapacity(sql);
+                buf.writeByteAssumeCapacity(0);
+                buf.writeIntBigAssumeCapacity(u16, @intCast(param_count));
+
+                inline for (fields) |field| {
+                    const oid = types.inferOid(field.type);
+                    buf.writeIntBigAssumeCapacity(i32, oid);
+                }
+            }
+
+            // 2. Bind ('B')
+            {
+                // Since we don't know the exact length of encoded values yet, we rely on `types.bindValue`
+                // which writes to buffer. But we need to write the header first.
+                // We assume default text/binary format logic in `bindValue`.
+
+                // We need to reserve space? No, `bindValue` appends.
+                // But we need to write the 'B' header.
+                // We'll use a placeholder for length.
+                buf.writeByteAssumeCapacity('B');
+                const len_pos = buf.len();
+                try buf.write(&.{ 0, 0, 0, 0 }); // length placeholder
+
+                try buf.writeByte(0); // unnamed destination portal
+                try buf.writeByte(0); // unnamed source statement
+
+                try buf.writeIntBig(u16, @intCast(param_count)); // num formats
+                const formats_start = buf.len();
+                try buf.writeByteNTimes(0, param_count * 2); // placeholders
+
+                try buf.writeIntBig(u16, @intCast(param_count)); // num params
+
+                inline for (fields, 0..) |field, i| {
+                    const format_pos = formats_start + (i * 2);
+                    const oid = types.inferOid(field.type);
+                    const val = @field(args, field.name);
+                    try types.bindValue(field.type, oid, val, buf, format_pos);
+                }
+
+                // Result columns format codes.
+                // We don't know the result columns yet!
+                // So we ask for all text (0) or all binary (1).
+                // Let's ask for all text (0) to be safe/compatible for now, as we don't have `describe` result.
+                try buf.write(&.{ 0, 0 });
+
+                // Patch length
+                const total_len = buf.len() - len_pos;
+                std.mem.writeInt(u32, buf.buf[len_pos..len_pos+4], @intCast(total_len), .big);
+            }
+
+            // 3. Describe Portal ('D')
+            {
+                const payload_len = 6; // 4 + 'P' + 0
+                try buf.ensureUnusedCapacity(1 + payload_len);
+                buf.writeByteAssumeCapacity('D');
+                buf.writeIntBigAssumeCapacity(u32, payload_len);
+                buf.writeByteAssumeCapacity('P'); // Describe Portal
+                buf.writeByteAssumeCapacity(0);   // unnamed portal
+            }
+
+            // 4. Execute ('E')
+            {
+                const payload_len = 9;
+                try buf.ensureUnusedCapacity(1 + payload_len);
+                buf.writeByteAssumeCapacity('E');
+                buf.writeIntBigAssumeCapacity(u32, payload_len);
+                buf.writeByteAssumeCapacity(0); // unnamed portal
+                buf.writeIntBigAssumeCapacity(u32, 0); // no row limit
+            }
+        }
+
+        pub fn sync(self: *PipelineSession) !void {
+            const buf = &self.conn._buf;
+            // Sync ('S')
+            try buf.write(&.{ 'S', 0, 0, 0, 4 });
+            try self.conn.write(buf.string());
+            buf.reset();
+        }
+
+        pub const Iterator = struct {
+            session: *PipelineSession,
+
+            // We need to keep state between next() calls because `Describe` tells us about
+            // the *next* `DataRow` set.
+            // We might have multiple results buffered.
+
+            pub fn next(self: *Iterator) !?*Result {
+                const conn = self.session.conn;
+                while (true) {
+                    const msg = try conn.read();
+                    switch (msg.type) {
+                        '1', '2' => {}, // ParseComplete, BindComplete - ignore
+                        'T' => {
+                            // RowDescription
+                            // We need to parse this to prepare the Result state
+                            const data = msg.data;
+                            const column_count = std.mem.readInt(u16, data[0..2], .big);
+
+                            const arena = try self.session.allocator.create(ArenaAllocator);
+                            arena.* = ArenaAllocator.init(self.session.allocator);
+
+                            // Allocate new state for this result using arena
+                            var state = try Result.State.init(arena.allocator(), column_count);
+                            // Populate state
+                            try state.from(column_count, data, arena.allocator());
+
+                            const result = try arena.allocator().create(Result);
+                            result.* = .{
+                                ._conn = conn,
+                                ._arena = arena,
+                                ._release_conn = false,
+                                ._oids = state.oids[0..column_count],
+                                ._values = state.values[0..column_count],
+                                .column_names = state.names[0..column_count],
+                                .number_of_columns = column_count,
+                                ._expect_ready_for_query = false,
+                            };
+                            return result;
+                        },
+                        'n' => {
+                            // NoData (from Describe) - usually for commands like INSERT/UPDATE without RETURNING
+                            // We still return a Result, but with 0 columns.
+                            const arena = try self.session.allocator.create(ArenaAllocator);
+                            arena.* = ArenaAllocator.init(self.session.allocator);
+
+                            const result = try arena.allocator().create(Result);
+                            result.* = .{
+                                ._conn = conn,
+                                ._arena = arena,
+                                ._release_conn = false,
+                                ._oids = &[_]i32{},
+                                ._values = &[_]lib.types.Value{},
+                                .column_names = &[_][]const u8{},
+                                .number_of_columns = 0,
+                                ._expect_ready_for_query = false,
+                            };
+                            return result;
+                        },
+                        'C' => {
+                            // CommandComplete without previous RowDescription/NoData?
+                            // This happens if we skipped Describe?
+                            // But we sent Describe. So we should get 'n' or 'T' before 'C'.
+                            // UNLESS `Execute` was for an empty statement?
+                            // Or `Describe` returns `NoData`.
+
+                            // If we get 'C' here, it might be the end of the query execution for the *previous* result?
+                            // No, `Result.next()` consumes 'C'.
+                            // So if we returned a `Result` above (on 'T' or 'n'), the user would call `result.next()` until null.
+                            // `result.next()` consumes 'D' (DataRow) until 'C' (CommandComplete).
+
+                            // So `Iterator.next()` should ideally be called *after* the user is done with the previous Result.
+                            // If the user didn't drain the previous result, `conn` is in a state where it has data.
+                            // `conn.read()` would pick up 'D'.
+
+                            // If `Iterator.next()` encounters 'D', it means the previous result wasn't drained.
+                            // We should probably drain it?
+                            // Or return error?
+                            // Or `Result` should automatically drain in deinit?
+                            // `src/result.zig` says "You must call drain".
+
+                            // If we encounter 'Z', we are done.
+                        },
+                        'Z' => {
+                            self.session.conn._state = switch (msg.data[0]) {
+                                'I' => .idle,
+                                'T' => .transaction,
+                                'E' => .fail,
+                                else => unreachable,
+                            };
+                            return null;
+                        },
+                        'E' => return conn.setErr(msg.data),
+                        'N' => {
+                            if (conn._notice_cb) |cb| {
+                                const notice = proto.NoticeResponse.parse(msg.data);
+                                cb({}, notice);
+                            }
+                        },
+                        else => return conn.unexpectedDBMessage(),
+                    }
+                }
+            }
+        };
+
+        pub fn results(self: *PipelineSession) Iterator {
+            return Iterator{ .session = self };
+        }
+    };
+
     pub const CopySession = struct {
         conn: *Conn,
         direction: enum { in, out },
@@ -477,6 +692,15 @@ pub const Conn = struct {
 
     pub fn getPreparedDescribe(self: *Conn, name: []const u8) ?*Stmt.Describe {
         return self._prepared_statements.getPtr(name);
+    }
+
+    pub fn pipeline(self: *Conn) !PipelineSession {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+        self._buf.reset();
+        self._state = .query;
+        return PipelineSession{ .conn = self, .allocator = self._allocator };
     }
 
     pub fn copy(self: *Conn, sql: []const u8) !CopySession {
@@ -1769,4 +1993,8 @@ const DummyEnum = enum {
 test {
     _ = @import("../tests/test_copy.zig");
     _ = @import("../tests/test_cancel_notice.zig");
+}
+
+test {
+    _ = @import("../tests/test_pipeline.zig");
 }

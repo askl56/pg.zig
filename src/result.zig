@@ -28,6 +28,12 @@ pub const Result = struct {
     // Used when the result came directly from the pool.query() helper.
     _release_conn: bool,
 
+    // Set to true if we expect a ReadyForQuery ('Z') message after CommandComplete.
+    // False for pipeline mode where 'Z' comes later.
+    _expect_ready_for_query: bool = true,
+
+    rows_affected: ?usize = null,
+
     pub fn deinit(self: *const Result) void {
         // value.data references the buffer of the reader, this buffer is potentially
         // reused and potentially discarded. There are at least a few very good
@@ -117,7 +123,13 @@ pub const Result = struct {
                 };
             },
             'C' => {
-                try self._conn.readyForQuery();
+                const cc = try proto.CommandComplete.parse(msg.data);
+                if (cc.rowsAffected()) |n| {
+                    self.rows_affected = @intCast(n);
+                }
+                if (self._expect_ready_for_query) {
+                    try self._conn.readyForQuery();
+                }
                 return null;
             },
             else => return error.UnexpectedDBMessage,
