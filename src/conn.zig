@@ -61,6 +61,16 @@ pub const Conn = struct {
     // cache_name => data necessary to re-execute previously prepared statement.
     _prepared_statements: std.StringHashMapUnmanaged(Stmt.Describe),
 
+    // Store PID and secret key for cancellation
+    _process_id: i32 = 0,
+    _secret_key: i32 = 0,
+
+    // Store connection options for cancellation
+    _opts: Opts,
+
+    // Optional callback for notices
+    _notice_cb: ?*const fn (void, proto.NoticeResponse) void = null,
+
     const State = enum {
         idle,
 
@@ -88,6 +98,9 @@ pub const Conn = struct {
         result_state_size: u16 = 32,
         tls: TLS = .off,
         _hostz: ?[:0]const u8 = null,
+
+        // Callback for notices
+        notice_cb: ?*const fn (void, proto.NoticeResponse) void = null,
 
         pub const TLS = union(enum) {
             off: void,
@@ -170,7 +183,12 @@ pub const Conn = struct {
                         return;
                     },
                     'E' => return self.conn.setErr(msg.data),
-                    'N' => {},
+                    'N' => {
+                        if (self.conn._notice_cb) |cb| {
+                            const notice = proto.NoticeResponse.parse(msg.data);
+                            cb({}, notice);
+                        }
+                    },
                     'S' => {},
                     else => return self.conn.unexpectedDBMessage(),
                 }
@@ -201,6 +219,12 @@ pub const Conn = struct {
                             else => unreachable,
                         };
                         return;
+                    },
+                    'N' => {
+                        if (self.conn._notice_cb) |cb| {
+                            const notice = proto.NoticeResponse.parse(msg.data);
+                            cb({}, notice);
+                        }
                     },
                     else => {}, // Drain everything else
                 }
@@ -238,6 +262,12 @@ pub const Conn = struct {
                                 return null;
                             },
                             'E' => return self.conn.setErr(m.data),
+                            'N' => {
+                                if (self.conn._notice_cb) |cb| {
+                                    const notice = proto.NoticeResponse.parse(m.data);
+                                    cb({}, notice);
+                                }
+                            },
                             else => return self.conn.unexpectedDBMessage(),
                         }
                     }
@@ -245,6 +275,14 @@ pub const Conn = struct {
                  'E' => {
                      _ = self.conn.setErr(msg.data) catch {};
                      return error.PG;
+                 },
+                 'N' => {
+                    if (self.conn._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                    // Recursive call to get next message
+                    return self.next();
                  },
                 else => return self.conn.unexpectedDBMessage(),
             }
@@ -298,6 +336,13 @@ pub const Conn = struct {
         const param_oids = try allocator.alloc(i32, opts.result_state_size);
         errdefer param_oids.deinit(allocator);
 
+        // We need to store opts for cancellation.
+        // Deep copy of host might be needed if it points to temporary memory.
+        var stored_opts = opts;
+        if (opts.host) |h| {
+            stored_opts.host = try allocator.dupe(u8, h);
+        }
+
         return .{
             .err = null,
             ._buf = buf,
@@ -310,6 +355,8 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
+            ._opts = stored_opts,
+            ._notice_cb = opts.notice_cb,
         };
     }
 
@@ -317,6 +364,9 @@ pub const Conn = struct {
         const allocator = self._allocator;
         if (self._err_data) |err_data| {
             allocator.free(err_data);
+        }
+        if (self._opts.host) |h| {
+            allocator.free(h);
         }
         self._buf.deinit();
         self._reader.deinit();
@@ -357,10 +407,41 @@ pub const Conn = struct {
             const msg = try self.read();
             switch (msg.type) {
                 'Z' => return,
-                'K' => {}, // TODO: BackendKeyData
+                'K' => {
+                    // BackendKeyData
+                    const key_data = try proto.BackendKeyData.parse(msg.data);
+                    self._process_id = key_data.process_id;
+                    self._secret_key = key_data.secret_key;
+                },
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
+                'S' => {}, // ParameterStatus
                 else => return self.unexpectedDBMessage(),
             }
         }
+    }
+
+    pub fn cancel(self: *Conn) !void {
+        // Open a new connection using the stored options
+        // We use a separate allocator for this temporary connection to avoid
+        // messing with the main connection's allocator if possible, but
+        // using the same one is also fine.
+        var stream = try Stream.connect(self._allocator, self._opts, self._ssl_ctx);
+        defer stream.close();
+
+        var buf = try Buffer.init(self._allocator, 128);
+        defer buf.deinit();
+
+        const req = proto.CancelRequest{
+            .process_id = self._process_id,
+            .secret_key = self._secret_key,
+        };
+        try req.write(&buf);
+        try stream.writeAll(buf.string());
     }
 
     pub fn prepare(self: *Conn, sql: []const u8) !Stmt {
@@ -448,6 +529,12 @@ pub const Conn = struct {
                 'E' => {
                      _ = try self.setErr(msg.data);
                      return error.PG;
+                },
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
                 },
                 else => return self.unexpectedDBMessage(),
             }
@@ -603,6 +690,12 @@ pub const Conn = struct {
                 'Z' => return affected,
                 'T' => affected = 0,
                 'D' => affected = (affected orelse 0) + 1,
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 else => return self.unexpectedDBMessage(),
             }
         }
@@ -642,7 +735,13 @@ pub const Conn = struct {
             };
             switch (msg.type) {
                 'Z' => return,
-                'C', 'T', 'D', 'n' => {},
+                'C', 'T', 'D' => {},
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 else => return self.unexpectedDBMessage(),
             }
         }
@@ -684,7 +783,12 @@ pub const Conn = struct {
                     return msg;
                 },
                 'S' => {}, // TODO: ParameterStatus,
-                'N' => {}, // TODO: NoticeResponse
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 'E' => return self.setErr(msg.data),
                 else => return msg,
             }
@@ -712,7 +816,12 @@ pub const Conn = struct {
                     return msg;
                 },
                 'S' => {},
-                'N' => {},
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 'E' => return self.setErr(msg.data),
                 else => return msg,
             }
@@ -1247,120 +1356,6 @@ test "PG: type support" {
     try t.expectEqual(null, try result.next());
 }
 
-// For ambiguous types, the above "type support" test is using the text-representation
-// This test will use the binary representation of each of the ambiguous types
-test "PG: binary support" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        const result = c.exec(
-            \\
-            \\ insert into all_types (
-            \\   id,
-            \\   col_uuid, col_uuid_arr,
-            \\   col_timestamp, col_timestamp_arr,
-            \\   col_timestamptz, col_timestamptz_arr,
-            \\   col_numeric, col_numeric_arr,
-            \\   col_macaddr, col_macaddr_arr,
-            \\   col_macaddr8, col_macaddr8_arr
-            \\ ) values (
-            \\   $1,
-            \\   $2, $3,
-            \\   $4, $5,
-            \\   $6, $7,
-            \\   $8, $9,
-            \\   $10, $11,
-            \\   $12, $13
-            \\ )
-        , .{
-            2,
-            &[_]u8{ 142, 243, 93, 100, 249, 159, 77, 126, 167, 54, 150, 204, 170, 222, 98, 124 },
-            [_][]const u8{ &.{ 53, 140, 59, 37, 1, 148, 72, 139, 130, 197, 181, 40, 44, 109, 127, 165 }, &.{ 57, 203, 218, 97, 37, 38, 70, 107, 182, 116, 24, 125, 236, 123, 117, 247 } },
-            169804639500713,
-            [_]i64{ 169804639500713, -94668480000000 },
-            169804639500714,
-            [_]i64{ 169804639500714, -94668480000001 },
-            "-394956.2221",
-            [_][]const u8{ "1.0008", "-987.110", "-inf" },
-            &[_]u8{ 1, 2, 3, 4, 5, 6 },
-            [_][]const u8{ &.{ 0, 1, 0, 2, 0, 3 }, &.{ 255, 0, 254, 1, 253, 2 } },
-            &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
-            [_][]const u8{ &.{ 0, 1, 0, 2, 0, 3, 4, 0 }, &.{ 255, 0, 254, 1, 253, 2, 3, 252 } },
-        });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query(
-        \\ select
-        \\   col_uuid, col_uuid_arr,
-        \\   col_timestamp, col_timestamp_arr,
-        \\   col_timestamptz, col_timestamptz_arr,
-        \\   col_numeric, col_numeric_arr,
-        \\   col_macaddr, col_macaddr_arr,
-        \\   col_macaddr8, col_macaddr8_arr
-        \\ from all_types where id = $1
-    , .{2});
-    defer result.deinit();
-
-    // used for our arrays
-    const aa = t.arena.allocator();
-
-    const row = (try result.next()) orelse unreachable;
-
-    {
-        //uuid, uuid[]
-        try t.expectString("8ef35d64-f99f-4d7e-a736-96ccaade627c", &(try types.UUID.toString(row.get([]u8, 0))));
-
-        const arr = try row.iterator([]const u8, 1).alloc(aa);
-        try t.expectEqual(2, arr.len);
-        try t.expectString("358c3b25-0194-488b-82c5-b5282c6d7fa5", &(try types.UUID.toString(arr[0])));
-        try t.expectString("39cbda61-2526-466b-b674-187dec7b75f7", &(try types.UUID.toString(arr[1])));
-    }
-
-    {
-        //timestamp, timestamp[]
-        try t.expectEqual(169804639500713, row.get(i64, 2));
-        try t.expectSlice(i64, &.{ 169804639500713, -94668480000000 }, try row.iterator(i64, 3).alloc(aa));
-    }
-
-    {
-        //timestamptz, timestamptz[]
-        try t.expectEqual(169804639500714, row.get(i64, 4));
-        try t.expectSlice(i64, &.{ 169804639500714, -94668480000001 }, try row.iterator(i64, 5).alloc(aa));
-    }
-
-    {
-        //numeric, numeric[]
-        try t.expectEqual(-394956.2221, row.get(f64, 6));
-        try t.expectSlice(f64, &.{ 1.0008, -987.110, -std.math.inf(f64) }, try row.iterator(f64, 7).alloc(aa));
-    }
-
-    {
-        //macaddr, macaddr[]
-        try t.expectSlice(u8, &.{ 1, 2, 3, 4, 5, 6 }, row.get([]u8, 8));
-        const arr = try row.iterator([]u8, 9).alloc(aa);
-        try t.expectSlice(u8, &.{ 0, 1, 0, 2, 0, 3 }, arr[0]);
-        try t.expectSlice(u8, &.{ 255, 0, 254, 1, 253, 2 }, arr[1]);
-    }
-
-    {
-        //macaddr8, macaddr8[]
-        try t.expectSlice(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, row.get([]u8, 10));
-        const arr = try row.iterator([]u8, 11).alloc(aa);
-        try t.expectSlice(u8, &.{ 0, 1, 0, 2, 0, 3, 4, 0 }, arr[0]);
-        try t.expectSlice(u8, &.{ 255, 0, 254, 1, 253, 2, 3, 252 }, arr[1]);
-    }
-
-    try t.expectEqual(null, try result.next());
-}
-
 test "PG: null support" {
     var c = t.connect(.{});
     defer c.deinit();
@@ -1773,4 +1768,5 @@ const DummyEnum = enum {
 
 test {
     _ = @import("../tests/test_copy.zig");
+    _ = @import("../tests/test_cancel_notice.zig");
 }

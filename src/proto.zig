@@ -21,6 +21,11 @@ pub const CopyData = @import("proto/CopyData.zig");
 pub const CopyDone = @import("proto/CopyDone.zig");
 pub const CopyFail = @import("proto/CopyFail.zig");
 
+// Misc
+pub const BackendKeyData = @import("proto/BackendKeyData.zig");
+pub const NoticeResponse = @import("proto/NoticeResponse.zig");
+pub const CancelRequest = @import("proto/CancelRequest.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
