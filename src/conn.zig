@@ -72,6 +72,12 @@ pub const Conn = struct {
 
         // we're in a transaction
         transaction,
+
+        // we're in a copy in state
+        copy_in,
+
+        // we're in a copy out state
+        copy_out,
     };
 
     pub const Opts = struct {
@@ -113,6 +119,136 @@ pub const Conn = struct {
         // When not null, the prepared statement will be cached and re-used
         // by subsequent queries using the same name.
         cache_name: ?[]const u8 = null,
+    };
+
+    pub const CopySession = struct {
+        conn: *Conn,
+        direction: enum { in, out },
+        format: u8, // 0 = text, 1 = binary
+        columns: u16,
+        column_formats: []u16,
+
+        pub fn deinit(self: CopySession) void {
+            self.conn._allocator.free(self.column_formats);
+        }
+
+        pub fn write(self: *CopySession, data: []const u8) !void {
+            if (self.direction != .in) return error.WrongCopyDirection;
+            var buf = &self.conn._buf;
+            buf.reset();
+            const msg = proto.CopyData{ .data = data };
+            try msg.write(buf);
+            try self.conn.write(buf.string());
+        }
+
+        pub fn done(self: *CopySession) !void {
+            if (self.direction != .in) return error.WrongCopyDirection;
+            var buf = &self.conn._buf;
+            buf.reset();
+            try proto.CopyDone.write(buf);
+            try self.conn.write(buf.string());
+
+            // Wait for CommandComplete
+            while (true) {
+                 const msg = self.conn.read() catch |err| {
+                    if (err == error.PG) {
+                        self.conn.readyForQuery() catch {};
+                    }
+                    return err;
+                };
+                switch (msg.type) {
+                    'C' => {
+                        // CommandComplete
+                    },
+                    'Z' => {
+                        self.conn._state = switch (msg.data[0]) {
+                            'I' => .idle,
+                            'T' => .transaction,
+                            'E' => .fail,
+                            else => unreachable,
+                        };
+                        return;
+                    },
+                    'E' => return self.conn.setErr(msg.data),
+                    'N' => {},
+                    'S' => {},
+                    else => return self.conn.unexpectedDBMessage(),
+                }
+            }
+        }
+
+        pub fn fail(self: *CopySession, message: []const u8) !void {
+             if (self.direction != .in) return error.WrongCopyDirection;
+            var buf = &self.conn._buf;
+            buf.reset();
+            const msg = proto.CopyFail{ .message = message };
+            try msg.write(buf);
+            try self.conn.write(buf.string());
+            // Expect ErrorResponse from server
+             while (true) {
+                 const msg = self.conn.read() catch |err| {
+                    if (err == error.PG) {
+                        self.conn.readyForQuery() catch {};
+                    }
+                    return err;
+                };
+                switch (msg.type) {
+                    'Z' => {
+                        self.conn._state = switch (msg.data[0]) {
+                            'I' => .idle,
+                            'T' => .transaction,
+                            'E' => .fail,
+                            else => unreachable,
+                        };
+                        return;
+                    },
+                    else => {}, // Drain everything else
+                }
+            }
+        }
+
+        pub fn next(self: *CopySession) !?[]const u8 {
+            if (self.direction != .out) return error.WrongCopyDirection;
+            const msg = try self.conn.read();
+            switch (msg.type) {
+                'd' => { // CopyData
+                     // The data in msg.data is valid until the next call to read()
+                     // But CopyData struct usually just wraps it.
+                     // The proto.CopyData.parse is trivial
+                     return msg.data;
+                },
+                'c' => { // CopyDone
+                    // Expect CommandComplete then ReadyForQuery
+                     while (true) {
+                        const m = self.conn.read() catch |err| {
+                            if (err == error.PG) {
+                                self.conn.readyForQuery() catch {};
+                            }
+                            return err;
+                        };
+                         switch (m.type) {
+                            'C' => {},
+                            'Z' => {
+                                self.conn._state = switch (m.data[0]) {
+                                    'I' => .idle,
+                                    'T' => .transaction,
+                                    'E' => .fail,
+                                    else => unreachable,
+                                };
+                                return null;
+                            },
+                            'E' => return self.conn.setErr(m.data),
+                            else => return self.conn.unexpectedDBMessage(),
+                        }
+                    }
+                },
+                 'E' => {
+                     _ = self.conn.setErr(msg.data) catch {};
+                     return error.PG;
+                 },
+                else => return self.conn.unexpectedDBMessage(),
+            }
+        }
     };
 
     pub fn openAndAuthUri(allocator: Allocator, uri: std.Uri) !Conn {
@@ -260,6 +396,62 @@ pub const Conn = struct {
 
     pub fn getPreparedDescribe(self: *Conn, name: []const u8) ?*Stmt.Describe {
         return self._prepared_statements.getPtr(name);
+    }
+
+    pub fn copy(self: *Conn, sql: []const u8) !CopySession {
+         if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        var buf = &self._buf;
+        buf.reset();
+
+        try self._reader.startFlow(self._allocator, null);
+
+        const simple_query = proto.Query{ .sql = sql };
+        try simple_query.write(buf);
+        lib.metrics.query();
+        self._state = .query;
+        try self.write(buf.string());
+
+        while(true) {
+             const msg = self.read() catch |err| {
+                if (err == error.PG) {
+                    self.readyForQuery() catch {};
+                }
+                return err;
+            };
+
+            switch (msg.type) {
+                'G' => { // CopyInResponse
+                    const res = try proto.CopyInResponse.parse(self._allocator, msg.data);
+                    self._state = .copy_in;
+                    return CopySession{
+                        .conn = self,
+                        .direction = .in,
+                        .format = res.format,
+                        .columns = res.columns,
+                        .column_formats = res.column_formats,
+                    };
+                },
+                'H' => { // CopyOutResponse
+                    const res = try proto.CopyOutResponse.parse(self._allocator, msg.data);
+                    self._state = .copy_out;
+                     return CopySession{
+                        .conn = self,
+                        .direction = .out,
+                        .format = res.format,
+                        .columns = res.columns,
+                        .column_formats = res.column_formats,
+                    };
+                },
+                'E' => {
+                     _ = try self.setErr(msg.data);
+                     return error.PG;
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
     }
 
     pub fn query(self: *Conn, sql: []const u8, values: anytype) !*Result {
@@ -1569,503 +1761,6 @@ test "PG: numeric" {
     }
 }
 
-// char array encoding is a little special, so let's test variants
-test "PG: char" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    // read
-    var row = (try c.row(
-        \\ select $1::char[], $2::char[], $3::char[], $4::char[]
-    , .{ &[_]u8{','}, &[_]u8{ ',', '"' }, &[_]u8{ '\\', 'a', ' ' }, &[_]u8{ 'z', '@' } })).?;
-    defer row.deinit() catch {};
-
-    // used for our arrays
-    const aa = t.arena.allocator();
-
-    try t.expectSlice(u8, &.{','}, try row.iterator(u8, 0).alloc(aa));
-    try t.expectSlice(u8, &.{ ',', '"' }, try row.iterator(u8, 1).alloc(aa));
-    try t.expectSlice(u8, &.{ '\\', 'a', ' ' }, try row.iterator(u8, 2).alloc(aa));
-    try t.expectSlice(u8, &.{ 'z', '@' }, try row.iterator(u8, 3).alloc(aa));
-}
-
-test "PG: bind []const u8" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const value: []const u8 = "hello";
-
-    {
-        const result = c.exec("insert into all_types (id, col_text) values ($1, $2)", .{ 6, value });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_text from all_types where id = $1", .{6});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(6, row.get(i32, 0));
-    try t.expectString("hello", row.get([]u8, 1));
-}
-
-test "PG: bind []?i64" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?i64{ 1, null, 3 };
-
-    {
-        const result = c.exec("insert into all_types (id, col_int8_arr) values ($1, $2)", .{ 7, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_int8_arr from all_types where id = $1", .{7});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(7, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?i64, 1).alloc(t.arena.allocator());
-        try t.expectEqual(3, arr.len);
-        try t.expectEqual(1, arr[0]);
-        try t.expectEqual(null, arr[1]);
-        try t.expectEqual(3, arr[2]);
-    }
-}
-
-test "PG: bind []?f64" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?f64{ null, null, 0.2, null };
-
-    {
-        const result = c.exec("insert into all_types (id, col_float8_arr) values ($1, $2)", .{ 8, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_float8_arr from all_types where id = $1", .{8});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(8, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?f64, 1).alloc(t.arena.allocator());
-        try t.expectEqual(4, arr.len);
-        try t.expectEqual(null, arr[0]);
-        try t.expectEqual(null, arr[1]);
-        try t.expectEqual(0.2, arr[2]);
-        try t.expectEqual(null, arr[3]);
-    }
-}
-
-test "PG: bind []?bool" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?bool{ null, true, false, null };
-
-    {
-        const result = c.exec("insert into all_types (id, col_bool_arr) values ($1, $2)", .{ 9, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_bool_arr from all_types where id = $1", .{9});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(9, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?bool, 1).alloc(t.arena.allocator());
-        try t.expectEqual(4, arr.len);
-        try t.expectEqual(null, arr[0]);
-        try t.expectEqual(true, arr[1]);
-        try t.expectEqual(false, arr[2]);
-        try t.expectEqual(null, arr[3]);
-    }
-}
-
-test "PG: bind []?[]const u8" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?[]const u8{ "hello", null, null };
-
-    {
-        const result = c.exec("insert into all_types (id, col_text_arr) values ($1, $2)", .{ 10, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_text_arr from all_types where id = $1", .{10});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(10, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?[]const u8, 1).alloc(t.arena.allocator());
-        try t.expectEqual(3, arr.len);
-        try t.expectString("hello", arr[0].?);
-        try t.expectEqual(null, arr[1]);
-        try t.expectEqual(null, arr[2]);
-    }
-}
-
-test "PG: binary wrapper" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    _ = try c.exec(
-        \\ create extension if not exists postgis;
-        \\ create table if not exists places (
-        \\     id int not null,
-        \\     location geography not null
-        \\ );
-    , .{});
-
-    const data = lib.Binary{
-        .data = &.{ 1, 1, 0, 0, 32, 230, 16, 0, 0, 43, 107, 238, 243, 22, 122, 82, 192, 60, 20, 204, 226, 238, 89, 68, 64 },
-    };
-    var row = (try c.row("select $1::geography", .{data})).?;
-    defer row.deinit() catch {};
-    try t.expectString(data.data, row.get([]const u8, 0));
-}
-
-test "PG: isUnique" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        try t.expectError(error.PG, c.exec("insert into all_types (id, id) values ($1)", .{ 999, null }));
-        try t.expectEqual(false, c.err.?.isUnique());
-    }
-
-    {
-        _ = try c.exec("insert into all_types (id) values ($1)", .{999});
-        _ = try t.expectError(error.PG, c.exec("insert into all_types (id) values ($1)", .{999}));
-        try t.expectEqual(true, c.err.?.isUnique());
-    }
-
-    {
-        // can still use the connection after the error
-        _ = try t.expectError(error.PG, c.row("insert into all_types (id) values ($1) returning id", .{999}));
-        try t.expectEqual(true, c.err.?.isUnique());
-    }
-}
-
-test "PG: large read" {
-    var c = t.connect(.{ .read_buffer = 500 });
-    defer c.deinit();
-
-    {
-        // want this to be larger than our read_buffer
-        var rows = try c.query("select $1::text", .{"!" ** 1000});
-        defer rows.deinit();
-
-        const row = (try rows.next()).?;
-        try t.expectString("!" ** 1000, row.get([]u8, 0));
-        try t.expectEqual(null, try rows.next());
-    }
-
-    {
-        // with a row
-        var row = (try c.row("select $1::text", .{"z" ** 1000})).?;
-        defer row.deinit() catch {};
-        try t.expectString("z" ** 1000, row.get([]u8, 0));
-    }
-}
-
-test "Conn: dynamic buffer freed on error" {
-    var c = t.connect(.{ .read_buffer = 100 });
-    defer c.deinit();
-
-    var rows = try c.query("select $1::text", .{"!" ** 200});
-    defer rows.deinit();
-
-    const row = (try rows.next()).?;
-    try t.expectString("!" ** 200, row.get([]u8, 0));
-
-    // we end here, simulating the app returning an error. This causes
-    // rows.deinit() and c.deinit() to be called prematurely (from
-    // the point of view of our internal state). Specifically, conn.reader.endFlow
-    // isn't called.
-}
-
-test "PG: Record" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        var row = (try c.row("select row(9001, 'hello'::text)", .{})).?;
-        defer row.deinit() catch {};
-
-        var record = row.record(0);
-        try t.expectEqual(2, record.number_of_columns);
-        try t.expectEqual(9001, record.next(i32));
-        try t.expectString("hello", record.next([]const u8));
-    }
-
-    {
-        var row = (try c.row("select row(null)", .{})).?;
-        defer row.deinit() catch {};
-
-        var record = row.record(0);
-        try t.expectEqual(1, record.number_of_columns);
-        try t.expectEqual(null, record.next(?i32));
-    }
-}
-
-test "Conn: application_name" {
-    var conn = try Conn.open(t.allocator, .{});
-    defer conn.deinit();
-    try conn.auth(.{
-        .username = "pgz_user_clear",
-        .password = "pgz_user_clear_pw",
-        .database = "postgres",
-        .application_name = "pg_zig_test",
-    });
-
-    var row = (try conn.row("show application_name", .{})) orelse unreachable;
-    defer row.deinit() catch {};
-
-    try t.expectString("pg_zig_test", row.get([]const u8, 0));
-}
-
-test "PG: bind strictness" {
-    var c = t.connect(.{});
-    defer c.deinit();
-    try t.expectError(error.BindWrongType, c.row("select $1", .{100}));
-    try t.expectError(error.BindWrongType, c.row("select $1", .{10.2}));
-    try t.expectError(error.BindWrongType, c.row("select $1", .{true}));
-
-    try t.expectError(error.BindWrongType, c.row("select $1", .{@as(i32, 100)}));
-    try t.expectError(error.BindWrongType, c.row("select $1", .{@as(f32, 10.2)}));
-
-    // conn is still usable
-    try t.expectEqual(4, t.scalar(&c, "select 4"));
-}
-
-test "PG: eager error" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        // Some errors happen when the prepared statement is executed
-        try t.expectError(error.PG, c.query("select * from invalid", .{}));
-        try t.expectString("relation \"invalid\" does not exist", c.err.?.message);
-    }
-
-    {
-        // some errors only happen when the result is read
-        try c.begin();
-        defer c.rollback() catch {};
-        const sql = "create temp table test1 (id int) on commit drop";
-        _ = try c.exec(sql, .{});
-        try t.expectError(error.PG, c.query(sql, .{}));
-    }
-}
-
-// https://github.com/karlseguin/pg.zig/issues/44
-test "PG: eager error conn state" {
-    var pool = try lib.Pool.init(t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
-    defer pool.deinit();
-
-    {
-        var c = try pool.acquire();
-        defer c.release();
-
-        // duplicate it
-        _ = try c.exec("insert into all_types (id) values ($1)", .{2000});
-        try t.expectError(error.PG, c.exec("insert into all_types (id) values ($1)", .{2000}));
-    }
-
-    {
-        // only 1 connection in our pool, so the fact that the above fails and
-        // this one succeeds, means we're properly handling the failure
-        var c = try pool.acquire();
-        defer c.release();
-        _ = try c.exec("insert into all_types (id) values ($1)", .{2001});
-    }
-}
-
-// https://github.com/karlseguin/pg.zig/issues/45
-test "PG: rollback during error" {
-    var pool = try lib.Pool.init(t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
-    defer pool.deinit();
-
-    _ = try pool.exec("truncate table all_types", .{});
-
-    {
-        var c = try pool.acquire();
-        defer c.release();
-
-        try c.begin();
-        // duplicate it
-        _ = try c.exec("insert into all_types (id) values ($1)", .{3000});
-        try t.expectError(error.PG, c.exec("insert into all_types (id) values ($1)", .{3000}));
-        try c.rollback();
-    }
-
-    {
-        // only 1 connection in our pool, so the fact that the above fails and
-        // this one succeeds, means we're properly handling the failure
-        var c = try pool.acquire();
-        defer c.release();
-        _ = try c.exec("insert into all_types (id) values ($1)", .{3001});
-    }
-
-    var result = try pool.query("select id from all_types order by id", .{});
-    defer result.deinit();
-
-    try t.expectEqual(3001, (try result.next()).?.get(i32, 0));
-    try t.expectEqual(null, (try result.next()));
-}
-
-test "open URI" {
-    const uri = try std.Uri.parse("postgresql://postgres:postgres@localhost:5432/postgres?tcp_user_timeout=5000");
-    var conn = try Conn.openAndAuthUri(t.allocator, uri);
-    conn.deinit();
-}
-
-test "Conn: TLS required" {
-    {
-        var conn = try Conn.open(t.allocator, .{ .tls = .off });
-        defer conn.deinit();
-        try t.expectError(error.PG, conn.auth(.{ .username = "pgz_user_ssl" }));
-        try t.expectEqual(true, std.mem.indexOf(u8, conn.err.?.message, "no encryption") != null);
-    }
-
-    {
-        var conn = t.connect(.{ .tls = Conn.Opts.TLS.require, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
-        defer conn.deinit();
-    }
-}
-
-test "Conn: TLS verify-full" {
-    try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.allocator, .{ .tls = .{ .verify_full = null } }));
-
-    {
-        var conn = t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
-        defer conn.deinit();
-    }
-}
-
-test "PG: cached query" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        var result = try c.queryOpts("select $1::int as id, $2::text as name", .{ 1, "leto" }, .{ .cache_name = "c1" });
-        try t.expectEqual(0, result.column_names.len);
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(1, row.get(i32, 0));
-        try t.expectString("leto", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-
-    {
-        var result = try c.queryOpts("slc", .{ 2, "ghanima" }, .{ .cache_name = "c1" });
-        try t.expectEqual(0, result.column_names.len);
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(2, row.get(i32, 0));
-        try t.expectString("ghanima", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-
-    try c.deallocate("c1");
-
-    {
-        try t.expectError(error.PG, c.queryOpts("slc", .{ 2, "ghanima" }, .{ .cache_name = "c1" }));
-        try t.expectEqual(true, std.mem.indexOf(u8, c.err.?.message, "syntax error at or near \"slc\"") != null);
-    }
-}
-
-test "PG: cached query with column names" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        var result = try c.queryOpts("select $1::int as id, $2::text as name", .{ 1, "leto" }, .{ .cache_name = "c2", .column_names = true });
-        try t.expectEqual(2, result.column_names.len);
-        try t.expectString("id", result.column_names[0]);
-        try t.expectString("name", result.column_names[1]);
-
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(1, row.get(i32, 0));
-        try t.expectString("leto", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-
-    {
-        var result = try c.queryOpts("", .{ 2, "ghanima" }, .{ .cache_name = "c2", .column_names = true });
-        try t.expectEqual(2, result.column_names.len);
-        try t.expectString("id", result.column_names[0]);
-        try t.expectString("name", result.column_names[1]);
-
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(2, row.get(i32, 0));
-        try t.expectString("ghanima", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-}
-
-fn expectNumeric(numeric: types.Numeric, expected: []const u8) !void {
-    var str_buf: [50]u8 = undefined;
-    try t.expectString(expected, try numeric.toString(&str_buf));
-
-    const a = try t.allocator.alloc(u8, numeric.estimatedStringLen());
-    defer t.allocator.free(a);
-    try t.expectString(expected, try numeric.toString(a));
-
-    if (std.mem.eql(u8, expected, "nan")) {
-        try t.expectEqual(true, std.math.isNan(numeric.toFloat()));
-    } else if (std.mem.eql(u8, expected, "inf")) {
-        try t.expectEqual(true, std.math.isInf(numeric.toFloat()));
-    } else if (std.mem.eql(u8, expected, "-inf")) {
-        try t.expectEqual(true, std.math.isNegativeInf(numeric.toFloat()));
-    } else {
-        try t.expectDelta(try std.fmt.parseFloat(f64, expected), numeric.toFloat(), 0.000001);
-    }
-}
-
 const DummyStruct = struct {
     id: i32,
     name: []const u8,
@@ -2075,3 +1770,7 @@ const DummyEnum = enum {
     val1,
     val2,
 };
+
+test {
+    _ = @import("../tests/test_copy.zig");
+}

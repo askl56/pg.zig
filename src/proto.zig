@@ -14,6 +14,13 @@ pub const SASLResponse = @import("proto/SASLResponse.zig");
 pub const StartupMessage = @import("proto/StartupMessage.zig");
 pub const Sync = @import("proto/Sync.zig");
 
+// COPY messages
+pub const CopyInResponse = @import("proto/CopyInResponse.zig");
+pub const CopyOutResponse = @import("proto/CopyOutResponse.zig");
+pub const CopyData = @import("proto/CopyData.zig");
+pub const CopyDone = @import("proto/CopyDone.zig");
+pub const CopyFail = @import("proto/CopyFail.zig");
+
 test {
     @import("std").testing.refAllDecls(@This());
 }
