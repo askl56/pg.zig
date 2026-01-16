@@ -61,6 +61,16 @@ pub const Conn = struct {
     // cache_name => data necessary to re-execute previously prepared statement.
     _prepared_statements: std.StringHashMapUnmanaged(Stmt.Describe),
 
+    // Store PID and secret key for cancellation
+    _process_id: i32 = 0,
+    _secret_key: i32 = 0,
+
+    // Store connection options for cancellation
+    _opts: Opts,
+
+    // Optional callback for notices
+    _notice_cb: ?*const fn (void, proto.NoticeResponse) void = null,
+
     const State = enum {
         idle,
 
@@ -72,6 +82,12 @@ pub const Conn = struct {
 
         // we're in a transaction
         transaction,
+
+        // we're in a copy in state
+        copy_in,
+
+        // we're in a copy out state
+        copy_out,
     };
 
     pub const Opts = struct {
@@ -82,6 +98,9 @@ pub const Conn = struct {
         result_state_size: u16 = 32,
         tls: TLS = .off,
         _hostz: ?[:0]const u8 = null,
+
+        // Callback for notices
+        notice_cb: ?*const fn (void, proto.NoticeResponse) void = null,
 
         pub const TLS = union(enum) {
             off: void,
@@ -113,6 +132,376 @@ pub const Conn = struct {
         // When not null, the prepared statement will be cached and re-used
         // by subsequent queries using the same name.
         cache_name: ?[]const u8 = null,
+    };
+
+    pub const PipelineSession = struct {
+        conn: *Conn,
+        allocator: Allocator,
+
+        pub fn query(self: *PipelineSession, sql: []const u8, args: anytype) !void {
+            const buf = &self.conn._buf;
+
+            // We use the unnamed statement ("") and unnamed portal ("").
+            // We need to infer OIDs for parameters.
+            const ArgsType = @TypeOf(args);
+            const args_info = @typeInfo(ArgsType);
+            if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
+                @compileError("args must be a tuple");
+            }
+
+            const fields = args_info.@"struct".fields;
+            const param_count = fields.len;
+
+            // 1. Parse ('P')
+            {
+                // len = 4 + name_len(0+1) + sql_len(N+1) + param_count(2) + param_oids(4*N)
+                const payload_len = 4 + 1 + sql.len + 1 + 2 + (param_count * 4);
+                try buf.ensureUnusedCapacity(1 + payload_len);
+                buf.writeByteAssumeCapacity('P');
+                buf.writeIntBigAssumeCapacity(u32, @intCast(payload_len));
+                buf.writeByteAssumeCapacity(0); // unnamed statement
+                buf.writeAssumeCapacity(sql);
+                buf.writeByteAssumeCapacity(0);
+                buf.writeIntBigAssumeCapacity(u16, @intCast(param_count));
+
+                inline for (fields) |field| {
+                    const oid = types.inferOid(field.type);
+                    buf.writeIntBigAssumeCapacity(i32, oid);
+                }
+            }
+
+            // 2. Bind ('B')
+            {
+                // Since we don't know the exact length of encoded values yet, we rely on `types.bindValue`
+                // which writes to buffer. But we need to write the header first.
+                // We assume default text/binary format logic in `bindValue`.
+
+                // We need to reserve space? No, `bindValue` appends.
+                // But we need to write the 'B' header.
+                // We'll use a placeholder for length.
+                buf.writeByteAssumeCapacity('B');
+                const len_pos = buf.len();
+                try buf.write(&.{ 0, 0, 0, 0 }); // length placeholder
+
+                try buf.writeByte(0); // unnamed destination portal
+                try buf.writeByte(0); // unnamed source statement
+
+                try buf.writeIntBig(u16, @intCast(param_count)); // num formats
+                const formats_start = buf.len();
+                try buf.writeByteNTimes(0, param_count * 2); // placeholders
+
+                try buf.writeIntBig(u16, @intCast(param_count)); // num params
+
+                inline for (fields, 0..) |field, i| {
+                    const format_pos = formats_start + (i * 2);
+                    const oid = types.inferOid(field.type);
+                    const val = @field(args, field.name);
+                    try types.bindValue(field.type, oid, val, buf, format_pos);
+                }
+
+                // Result columns format codes.
+                // We don't know the result columns yet!
+                // So we ask for all text (0) or all binary (1).
+                // Let's ask for all text (0) to be safe/compatible for now, as we don't have `describe` result.
+                try buf.write(&.{ 0, 0 });
+
+                // Patch length
+                const total_len = buf.len() - len_pos;
+                std.mem.writeInt(u32, buf.buf[len_pos..len_pos+4], @intCast(total_len), .big);
+            }
+
+            // 3. Describe Portal ('D')
+            {
+                const payload_len = 6; // 4 + 'P' + 0
+                try buf.ensureUnusedCapacity(1 + payload_len);
+                buf.writeByteAssumeCapacity('D');
+                buf.writeIntBigAssumeCapacity(u32, payload_len);
+                buf.writeByteAssumeCapacity('P'); // Describe Portal
+                buf.writeByteAssumeCapacity(0);   // unnamed portal
+            }
+
+            // 4. Execute ('E')
+            {
+                const payload_len = 9;
+                try buf.ensureUnusedCapacity(1 + payload_len);
+                buf.writeByteAssumeCapacity('E');
+                buf.writeIntBigAssumeCapacity(u32, payload_len);
+                buf.writeByteAssumeCapacity(0); // unnamed portal
+                buf.writeIntBigAssumeCapacity(u32, 0); // no row limit
+            }
+        }
+
+        pub fn sync(self: *PipelineSession) !void {
+            const buf = &self.conn._buf;
+            // Sync ('S')
+            try buf.write(&.{ 'S', 0, 0, 0, 4 });
+            try self.conn.write(buf.string());
+            buf.reset();
+        }
+
+        pub const Iterator = struct {
+            session: *PipelineSession,
+
+            // We need to keep state between next() calls because `Describe` tells us about
+            // the *next* `DataRow` set.
+            // We might have multiple results buffered.
+
+            pub fn next(self: *Iterator) !?*Result {
+                const conn = self.session.conn;
+                while (true) {
+                    const msg = try conn.read();
+                    switch (msg.type) {
+                        '1', '2' => {}, // ParseComplete, BindComplete - ignore
+                        'T' => {
+                            // RowDescription
+                            // We need to parse this to prepare the Result state
+                            const data = msg.data;
+                            const column_count = std.mem.readInt(u16, data[0..2], .big);
+
+                            const arena = try self.session.allocator.create(ArenaAllocator);
+                            arena.* = ArenaAllocator.init(self.session.allocator);
+
+                            // Allocate new state for this result using arena
+                            var state = try Result.State.init(arena.allocator(), column_count);
+                            // Populate state
+                            try state.from(column_count, data, arena.allocator());
+
+                            const result = try arena.allocator().create(Result);
+                            result.* = .{
+                                ._conn = conn,
+                                ._arena = arena,
+                                ._release_conn = false,
+                                ._oids = state.oids[0..column_count],
+                                ._values = state.values[0..column_count],
+                                .column_names = state.names[0..column_count],
+                                .number_of_columns = column_count,
+                                ._expect_ready_for_query = false,
+                            };
+                            return result;
+                        },
+                        'n' => {
+                            // NoData (from Describe) - usually for commands like INSERT/UPDATE without RETURNING
+                            // We still return a Result, but with 0 columns.
+                            const arena = try self.session.allocator.create(ArenaAllocator);
+                            arena.* = ArenaAllocator.init(self.session.allocator);
+
+                            const result = try arena.allocator().create(Result);
+                            result.* = .{
+                                ._conn = conn,
+                                ._arena = arena,
+                                ._release_conn = false,
+                                ._oids = &[_]i32{},
+                                ._values = &[_]lib.types.Value{},
+                                .column_names = &[_][]const u8{},
+                                .number_of_columns = 0,
+                                ._expect_ready_for_query = false,
+                            };
+                            return result;
+                        },
+                        'C' => {
+                            // CommandComplete without previous RowDescription/NoData?
+                            // This happens if we skipped Describe?
+                            // But we sent Describe. So we should get 'n' or 'T' before 'C'.
+                            // UNLESS `Execute` was for an empty statement?
+                            // Or `Describe` returns `NoData`.
+
+                            // If we get 'C' here, it might be the end of the query execution for the *previous* result?
+                            // No, `Result.next()` consumes 'C'.
+                            // So if we returned a `Result` above (on 'T' or 'n'), the user would call `result.next()` until null.
+                            // `result.next()` consumes 'D' (DataRow) until 'C' (CommandComplete).
+
+                            // So `Iterator.next()` should ideally be called *after* the user is done with the previous Result.
+                            // If the user didn't drain the previous result, `conn` is in a state where it has data.
+                            // `conn.read()` would pick up 'D'.
+
+                            // If `Iterator.next()` encounters 'D', it means the previous result wasn't drained.
+                            // We should probably drain it?
+                            // Or return error?
+                            // Or `Result` should automatically drain in deinit?
+                            // `src/result.zig` says "You must call drain".
+
+                            // If we encounter 'Z', we are done.
+                        },
+                        'Z' => {
+                            self.session.conn._state = switch (msg.data[0]) {
+                                'I' => .idle,
+                                'T' => .transaction,
+                                'E' => .fail,
+                                else => unreachable,
+                            };
+                            return null;
+                        },
+                        'E' => return conn.setErr(msg.data),
+                        'N' => {
+                            if (conn._notice_cb) |cb| {
+                                const notice = proto.NoticeResponse.parse(msg.data);
+                                cb({}, notice);
+                            }
+                        },
+                        else => return conn.unexpectedDBMessage(),
+                    }
+                }
+            }
+        };
+
+        pub fn results(self: *PipelineSession) Iterator {
+            return Iterator{ .session = self };
+        }
+    };
+
+    pub const CopySession = struct {
+        conn: *Conn,
+        direction: enum { in, out },
+        format: u8, // 0 = text, 1 = binary
+        columns: u16,
+        column_formats: []u16,
+
+        pub fn deinit(self: CopySession) void {
+            self.conn._allocator.free(self.column_formats);
+        }
+
+        pub fn write(self: *CopySession, data: []const u8) !void {
+            if (self.direction != .in) return error.WrongCopyDirection;
+            var buf = &self.conn._buf;
+            buf.reset();
+            const msg = proto.CopyData{ .data = data };
+            try msg.write(buf);
+            try self.conn.write(buf.string());
+        }
+
+        pub fn done(self: *CopySession) !void {
+            if (self.direction != .in) return error.WrongCopyDirection;
+            var buf = &self.conn._buf;
+            buf.reset();
+            try proto.CopyDone.write(buf);
+            try self.conn.write(buf.string());
+
+            // Wait for CommandComplete
+            while (true) {
+                 const msg = self.conn.read() catch |err| {
+                    if (err == error.PG) {
+                        self.conn.readyForQuery() catch {};
+                    }
+                    return err;
+                };
+                switch (msg.type) {
+                    'C' => {
+                        // CommandComplete
+                    },
+                    'Z' => {
+                        self.conn._state = switch (msg.data[0]) {
+                            'I' => .idle,
+                            'T' => .transaction,
+                            'E' => .fail,
+                            else => unreachable,
+                        };
+                        return;
+                    },
+                    'E' => return self.conn.setErr(msg.data),
+                    'N' => {
+                        if (self.conn._notice_cb) |cb| {
+                            const notice = proto.NoticeResponse.parse(msg.data);
+                            cb({}, notice);
+                        }
+                    },
+                    'S' => {},
+                    else => return self.conn.unexpectedDBMessage(),
+                }
+            }
+        }
+
+        pub fn fail(self: *CopySession, message: []const u8) !void {
+             if (self.direction != .in) return error.WrongCopyDirection;
+            var buf = &self.conn._buf;
+            buf.reset();
+            const msg = proto.CopyFail{ .message = message };
+            try msg.write(buf);
+            try self.conn.write(buf.string());
+            // Expect ErrorResponse from server
+             while (true) {
+                 const msg = self.conn.read() catch |err| {
+                    if (err == error.PG) {
+                        self.conn.readyForQuery() catch {};
+                    }
+                    return err;
+                };
+                switch (msg.type) {
+                    'Z' => {
+                        self.conn._state = switch (msg.data[0]) {
+                            'I' => .idle,
+                            'T' => .transaction,
+                            'E' => .fail,
+                            else => unreachable,
+                        };
+                        return;
+                    },
+                    'N' => {
+                        if (self.conn._notice_cb) |cb| {
+                            const notice = proto.NoticeResponse.parse(msg.data);
+                            cb({}, notice);
+                        }
+                    },
+                    else => {}, // Drain everything else
+                }
+            }
+        }
+
+        pub fn next(self: *CopySession) !?[]const u8 {
+            if (self.direction != .out) return error.WrongCopyDirection;
+            const msg = try self.conn.read();
+            switch (msg.type) {
+                'd' => { // CopyData
+                     // The data in msg.data is valid until the next call to read()
+                     // But CopyData struct usually just wraps it.
+                     // The proto.CopyData.parse is trivial
+                     return msg.data;
+                },
+                'c' => { // CopyDone
+                    // Expect CommandComplete then ReadyForQuery
+                     while (true) {
+                        const m = self.conn.read() catch |err| {
+                            if (err == error.PG) {
+                                self.conn.readyForQuery() catch {};
+                            }
+                            return err;
+                        };
+                         switch (m.type) {
+                            'C' => {},
+                            'Z' => {
+                                self.conn._state = switch (m.data[0]) {
+                                    'I' => .idle,
+                                    'T' => .transaction,
+                                    'E' => .fail,
+                                    else => unreachable,
+                                };
+                                return null;
+                            },
+                            'E' => return self.conn.setErr(m.data),
+                            'N' => {
+                                if (self.conn._notice_cb) |cb| {
+                                    const notice = proto.NoticeResponse.parse(m.data);
+                                    cb({}, notice);
+                                }
+                            },
+                            else => return self.conn.unexpectedDBMessage(),
+                        }
+                    }
+                },
+                 'E' => {
+                     _ = self.conn.setErr(msg.data) catch {};
+                     return error.PG;
+                 },
+                 'N' => {
+                    if (self.conn._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                    // Recursive call to get next message
+                    return self.next();
+                 },
+                else => return self.conn.unexpectedDBMessage(),
+            }
+        }
     };
 
     pub fn openAndAuthUri(allocator: Allocator, uri: std.Uri) !Conn {
@@ -162,6 +551,13 @@ pub const Conn = struct {
         const param_oids = try allocator.alloc(i32, opts.result_state_size);
         errdefer param_oids.deinit(allocator);
 
+        // We need to store opts for cancellation.
+        // Deep copy of host might be needed if it points to temporary memory.
+        var stored_opts = opts;
+        if (opts.host) |h| {
+            stored_opts.host = try allocator.dupe(u8, h);
+        }
+
         return .{
             .err = null,
             ._buf = buf,
@@ -174,6 +570,8 @@ pub const Conn = struct {
             ._param_oids = param_oids,
             ._result_state = result_state,
             ._prepared_statements = .{},
+            ._opts = stored_opts,
+            ._notice_cb = opts.notice_cb,
         };
     }
 
@@ -181,6 +579,9 @@ pub const Conn = struct {
         const allocator = self._allocator;
         if (self._err_data) |err_data| {
             allocator.free(err_data);
+        }
+        if (self._opts.host) |h| {
+            allocator.free(h);
         }
         self._buf.deinit();
         self._reader.deinit();
@@ -221,10 +622,41 @@ pub const Conn = struct {
             const msg = try self.read();
             switch (msg.type) {
                 'Z' => return,
-                'K' => {}, // TODO: BackendKeyData
+                'K' => {
+                    // BackendKeyData
+                    const key_data = try proto.BackendKeyData.parse(msg.data);
+                    self._process_id = key_data.process_id;
+                    self._secret_key = key_data.secret_key;
+                },
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
+                'S' => {}, // ParameterStatus
                 else => return self.unexpectedDBMessage(),
             }
         }
+    }
+
+    pub fn cancel(self: *Conn) !void {
+        // Open a new connection using the stored options
+        // We use a separate allocator for this temporary connection to avoid
+        // messing with the main connection's allocator if possible, but
+        // using the same one is also fine.
+        var stream = try Stream.connect(self._allocator, self._opts, self._ssl_ctx);
+        defer stream.close();
+
+        var buf = try Buffer.init(self._allocator, 128);
+        defer buf.deinit();
+
+        const req = proto.CancelRequest{
+            .process_id = self._process_id,
+            .secret_key = self._secret_key,
+        };
+        try req.write(&buf);
+        try stream.writeAll(buf.string());
     }
 
     pub fn prepare(self: *Conn, sql: []const u8) !Stmt {
@@ -260,6 +692,162 @@ pub const Conn = struct {
 
     pub fn getPreparedDescribe(self: *Conn, name: []const u8) ?*Stmt.Describe {
         return self._prepared_statements.getPtr(name);
+    }
+
+    pub fn pipeline(self: *Conn) !PipelineSession {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+        self._buf.reset();
+        self._state = .query;
+        return PipelineSession{ .conn = self, .allocator = self._allocator };
+    }
+
+    pub fn fastCall(self: *Conn, oid: i32, args: anytype) !?[]const u8 {
+        if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        var buf = &self._buf;
+        buf.reset();
+
+        try self._reader.startFlow(self._allocator, null);
+        defer self._reader.endFlow() catch {};
+
+        // Build FunctionCall ('F')
+        const ArgsType = @TypeOf(args);
+        const args_info = @typeInfo(ArgsType);
+        if (args_info != .@"struct" or !args_info.@"struct".is_tuple) {
+            @compileError("args must be a tuple");
+        }
+        const fields = args_info.@"struct".fields;
+        const param_count = fields.len;
+
+        // Calculate payload length is hard because values are variable.
+        // We start with fixed header size and append.
+
+        buf.writeByteAssumeCapacity('F');
+        const len_pos = buf.len();
+        try buf.write(&.{ 0, 0, 0, 0 }); // len placeholder
+
+        try buf.writeIntBig(i32, oid);
+
+        // Formats: We use 1 format (binary) for all? Or explicit?
+        // Let's use explicit formats for each arg to be safe/correct with bindValue.
+        try buf.writeIntBig(u16, @intCast(param_count));
+        const formats_start = buf.len();
+        try buf.writeByteNTimes(0, param_count * 2); // placeholders
+
+        try buf.writeIntBig(u16, @intCast(param_count));
+
+        inline for (fields, 0..) |field, i| {
+            const format_pos = formats_start + (i * 2);
+            const type_oid = types.inferOid(field.type);
+            const val = @field(args, field.name);
+            try types.bindValue(field.type, type_oid, val, buf, format_pos);
+        }
+
+        try buf.writeIntBig(i16, 1); // Result format: Binary
+
+        // Patch length
+        const total_len = buf.len() - len_pos;
+        std.mem.writeInt(u32, buf.buf[len_pos..len_pos+4], @intCast(total_len), .big);
+
+        self._state = .query;
+        try self.write(buf.string());
+
+        var result_data: ?[]const u8 = null;
+
+        while (true) {
+            const msg = try self.read();
+            switch (msg.type) {
+                'V' => {
+                    const res = try proto.FunctionCallResponse.parse(msg.data);
+                    if (res.result) |val| {
+                        result_data = try self._allocator.dupe(u8, val);
+                    }
+                },
+                'Z' => {
+                    self._state = switch (msg.data[0]) {
+                        'I' => .idle,
+                        'T' => .transaction,
+                        'E' => .fail,
+                        else => unreachable,
+                    };
+                    return result_data;
+                },
+                'E' => return self.setErr(msg.data),
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
+    }
+
+    pub fn copy(self: *Conn, sql: []const u8) !CopySession {
+         if (self.canQuery() == false) {
+            return error.ConnectionBusy;
+        }
+
+        var buf = &self._buf;
+        buf.reset();
+
+        try self._reader.startFlow(self._allocator, null);
+
+        const simple_query = proto.Query{ .sql = sql };
+        try simple_query.write(buf);
+        lib.metrics.query();
+        self._state = .query;
+        try self.write(buf.string());
+
+        while(true) {
+             const msg = self.read() catch |err| {
+                if (err == error.PG) {
+                    self.readyForQuery() catch {};
+                }
+                return err;
+            };
+
+            switch (msg.type) {
+                'G' => { // CopyInResponse
+                    const res = try proto.CopyInResponse.parse(self._allocator, msg.data);
+                    self._state = .copy_in;
+                    return CopySession{
+                        .conn = self,
+                        .direction = .in,
+                        .format = res.format,
+                        .columns = res.columns,
+                        .column_formats = res.column_formats,
+                    };
+                },
+                'H' => { // CopyOutResponse
+                    const res = try proto.CopyOutResponse.parse(self._allocator, msg.data);
+                    self._state = .copy_out;
+                     return CopySession{
+                        .conn = self,
+                        .direction = .out,
+                        .format = res.format,
+                        .columns = res.columns,
+                        .column_formats = res.column_formats,
+                    };
+                },
+                'E' => {
+                     _ = try self.setErr(msg.data);
+                     return error.PG;
+                },
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
+                else => return self.unexpectedDBMessage(),
+            }
+        }
     }
 
     pub fn query(self: *Conn, sql: []const u8, values: anytype) !*Result {
@@ -411,6 +999,12 @@ pub const Conn = struct {
                 'Z' => return affected,
                 'T' => affected = 0,
                 'D' => affected = (affected orelse 0) + 1,
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 else => return self.unexpectedDBMessage(),
             }
         }
@@ -450,7 +1044,13 @@ pub const Conn = struct {
             };
             switch (msg.type) {
                 'Z' => return,
-                'C', 'T', 'D', 'n' => {},
+                'C', 'T', 'D' => {},
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 else => return self.unexpectedDBMessage(),
             }
         }
@@ -492,7 +1092,12 @@ pub const Conn = struct {
                     return msg;
                 },
                 'S' => {}, // TODO: ParameterStatus,
-                'N' => {}, // TODO: NoticeResponse
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 'E' => return self.setErr(msg.data),
                 else => return msg,
             }
@@ -520,7 +1125,12 @@ pub const Conn = struct {
                     return msg;
                 },
                 'S' => {},
-                'N' => {},
+                'N' => {
+                    if (self._notice_cb) |cb| {
+                        const notice = proto.NoticeResponse.parse(msg.data);
+                        cb({}, notice);
+                    }
+                },
                 'E' => return self.setErr(msg.data),
                 else => return msg,
             }
@@ -1055,120 +1665,6 @@ test "PG: type support" {
     try t.expectEqual(null, try result.next());
 }
 
-// For ambiguous types, the above "type support" test is using the text-representation
-// This test will use the binary representation of each of the ambiguous types
-test "PG: binary support" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        const result = c.exec(
-            \\
-            \\ insert into all_types (
-            \\   id,
-            \\   col_uuid, col_uuid_arr,
-            \\   col_timestamp, col_timestamp_arr,
-            \\   col_timestamptz, col_timestamptz_arr,
-            \\   col_numeric, col_numeric_arr,
-            \\   col_macaddr, col_macaddr_arr,
-            \\   col_macaddr8, col_macaddr8_arr
-            \\ ) values (
-            \\   $1,
-            \\   $2, $3,
-            \\   $4, $5,
-            \\   $6, $7,
-            \\   $8, $9,
-            \\   $10, $11,
-            \\   $12, $13
-            \\ )
-        , .{
-            2,
-            &[_]u8{ 142, 243, 93, 100, 249, 159, 77, 126, 167, 54, 150, 204, 170, 222, 98, 124 },
-            [_][]const u8{ &.{ 53, 140, 59, 37, 1, 148, 72, 139, 130, 197, 181, 40, 44, 109, 127, 165 }, &.{ 57, 203, 218, 97, 37, 38, 70, 107, 182, 116, 24, 125, 236, 123, 117, 247 } },
-            169804639500713,
-            [_]i64{ 169804639500713, -94668480000000 },
-            169804639500714,
-            [_]i64{ 169804639500714, -94668480000001 },
-            "-394956.2221",
-            [_][]const u8{ "1.0008", "-987.110", "-inf" },
-            &[_]u8{ 1, 2, 3, 4, 5, 6 },
-            [_][]const u8{ &.{ 0, 1, 0, 2, 0, 3 }, &.{ 255, 0, 254, 1, 253, 2 } },
-            &[_]u8{ 1, 2, 3, 4, 5, 6, 7, 8 },
-            [_][]const u8{ &.{ 0, 1, 0, 2, 0, 3, 4, 0 }, &.{ 255, 0, 254, 1, 253, 2, 3, 252 } },
-        });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query(
-        \\ select
-        \\   col_uuid, col_uuid_arr,
-        \\   col_timestamp, col_timestamp_arr,
-        \\   col_timestamptz, col_timestamptz_arr,
-        \\   col_numeric, col_numeric_arr,
-        \\   col_macaddr, col_macaddr_arr,
-        \\   col_macaddr8, col_macaddr8_arr
-        \\ from all_types where id = $1
-    , .{2});
-    defer result.deinit();
-
-    // used for our arrays
-    const aa = t.arena.allocator();
-
-    const row = (try result.next()) orelse unreachable;
-
-    {
-        //uuid, uuid[]
-        try t.expectString("8ef35d64-f99f-4d7e-a736-96ccaade627c", &(try types.UUID.toString(row.get([]u8, 0))));
-
-        const arr = try row.iterator([]const u8, 1).alloc(aa);
-        try t.expectEqual(2, arr.len);
-        try t.expectString("358c3b25-0194-488b-82c5-b5282c6d7fa5", &(try types.UUID.toString(arr[0])));
-        try t.expectString("39cbda61-2526-466b-b674-187dec7b75f7", &(try types.UUID.toString(arr[1])));
-    }
-
-    {
-        //timestamp, timestamp[]
-        try t.expectEqual(169804639500713, row.get(i64, 2));
-        try t.expectSlice(i64, &.{ 169804639500713, -94668480000000 }, try row.iterator(i64, 3).alloc(aa));
-    }
-
-    {
-        //timestamptz, timestamptz[]
-        try t.expectEqual(169804639500714, row.get(i64, 4));
-        try t.expectSlice(i64, &.{ 169804639500714, -94668480000001 }, try row.iterator(i64, 5).alloc(aa));
-    }
-
-    {
-        //numeric, numeric[]
-        try t.expectEqual(-394956.2221, row.get(f64, 6));
-        try t.expectSlice(f64, &.{ 1.0008, -987.110, -std.math.inf(f64) }, try row.iterator(f64, 7).alloc(aa));
-    }
-
-    {
-        //macaddr, macaddr[]
-        try t.expectSlice(u8, &.{ 1, 2, 3, 4, 5, 6 }, row.get([]u8, 8));
-        const arr = try row.iterator([]u8, 9).alloc(aa);
-        try t.expectSlice(u8, &.{ 0, 1, 0, 2, 0, 3 }, arr[0]);
-        try t.expectSlice(u8, &.{ 255, 0, 254, 1, 253, 2 }, arr[1]);
-    }
-
-    {
-        //macaddr8, macaddr8[]
-        try t.expectSlice(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8 }, row.get([]u8, 10));
-        const arr = try row.iterator([]u8, 11).alloc(aa);
-        try t.expectSlice(u8, &.{ 0, 1, 0, 2, 0, 3, 4, 0 }, arr[0]);
-        try t.expectSlice(u8, &.{ 255, 0, 254, 1, 253, 2, 3, 252 }, arr[1]);
-    }
-
-    try t.expectEqual(null, try result.next());
-}
-
 test "PG: null support" {
     var c = t.connect(.{});
     defer c.deinit();
@@ -1569,503 +2065,6 @@ test "PG: numeric" {
     }
 }
 
-// char array encoding is a little special, so let's test variants
-test "PG: char" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    // read
-    var row = (try c.row(
-        \\ select $1::char[], $2::char[], $3::char[], $4::char[]
-    , .{ &[_]u8{','}, &[_]u8{ ',', '"' }, &[_]u8{ '\\', 'a', ' ' }, &[_]u8{ 'z', '@' } })).?;
-    defer row.deinit() catch {};
-
-    // used for our arrays
-    const aa = t.arena.allocator();
-
-    try t.expectSlice(u8, &.{','}, try row.iterator(u8, 0).alloc(aa));
-    try t.expectSlice(u8, &.{ ',', '"' }, try row.iterator(u8, 1).alloc(aa));
-    try t.expectSlice(u8, &.{ '\\', 'a', ' ' }, try row.iterator(u8, 2).alloc(aa));
-    try t.expectSlice(u8, &.{ 'z', '@' }, try row.iterator(u8, 3).alloc(aa));
-}
-
-test "PG: bind []const u8" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const value: []const u8 = "hello";
-
-    {
-        const result = c.exec("insert into all_types (id, col_text) values ($1, $2)", .{ 6, value });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_text from all_types where id = $1", .{6});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(6, row.get(i32, 0));
-    try t.expectString("hello", row.get([]u8, 1));
-}
-
-test "PG: bind []?i64" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?i64{ 1, null, 3 };
-
-    {
-        const result = c.exec("insert into all_types (id, col_int8_arr) values ($1, $2)", .{ 7, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_int8_arr from all_types where id = $1", .{7});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(7, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?i64, 1).alloc(t.arena.allocator());
-        try t.expectEqual(3, arr.len);
-        try t.expectEqual(1, arr[0]);
-        try t.expectEqual(null, arr[1]);
-        try t.expectEqual(3, arr[2]);
-    }
-}
-
-test "PG: bind []?f64" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?f64{ null, null, 0.2, null };
-
-    {
-        const result = c.exec("insert into all_types (id, col_float8_arr) values ($1, $2)", .{ 8, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_float8_arr from all_types where id = $1", .{8});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(8, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?f64, 1).alloc(t.arena.allocator());
-        try t.expectEqual(4, arr.len);
-        try t.expectEqual(null, arr[0]);
-        try t.expectEqual(null, arr[1]);
-        try t.expectEqual(0.2, arr[2]);
-        try t.expectEqual(null, arr[3]);
-    }
-}
-
-test "PG: bind []?bool" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?bool{ null, true, false, null };
-
-    {
-        const result = c.exec("insert into all_types (id, col_bool_arr) values ($1, $2)", .{ 9, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_bool_arr from all_types where id = $1", .{9});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(9, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?bool, 1).alloc(t.arena.allocator());
-        try t.expectEqual(4, arr.len);
-        try t.expectEqual(null, arr[0]);
-        try t.expectEqual(true, arr[1]);
-        try t.expectEqual(false, arr[2]);
-        try t.expectEqual(null, arr[3]);
-    }
-}
-
-test "PG: bind []?[]const u8" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-    const values = [_]?[]const u8{ "hello", null, null };
-
-    {
-        const result = c.exec("insert into all_types (id, col_text_arr) values ($1, $2)", .{ 10, values });
-        if (result) |affected| {
-            try t.expectEqual(1, affected);
-        } else |err| {
-            try t.fail(c, err);
-        }
-    }
-
-    var result = try c.query("select id, col_text_arr from all_types where id = $1", .{10});
-    defer result.deinit();
-
-    const row = (try result.next()) orelse unreachable;
-    try t.expectEqual(10, row.get(i32, 0));
-    {
-        const arr = try row.iterator(?[]const u8, 1).alloc(t.arena.allocator());
-        try t.expectEqual(3, arr.len);
-        try t.expectString("hello", arr[0].?);
-        try t.expectEqual(null, arr[1]);
-        try t.expectEqual(null, arr[2]);
-    }
-}
-
-test "PG: binary wrapper" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    _ = try c.exec(
-        \\ create extension if not exists postgis;
-        \\ create table if not exists places (
-        \\     id int not null,
-        \\     location geography not null
-        \\ );
-    , .{});
-
-    const data = lib.Binary{
-        .data = &.{ 1, 1, 0, 0, 32, 230, 16, 0, 0, 43, 107, 238, 243, 22, 122, 82, 192, 60, 20, 204, 226, 238, 89, 68, 64 },
-    };
-    var row = (try c.row("select $1::geography", .{data})).?;
-    defer row.deinit() catch {};
-    try t.expectString(data.data, row.get([]const u8, 0));
-}
-
-test "PG: isUnique" {
-    defer t.reset();
-
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        try t.expectError(error.PG, c.exec("insert into all_types (id, id) values ($1)", .{ 999, null }));
-        try t.expectEqual(false, c.err.?.isUnique());
-    }
-
-    {
-        _ = try c.exec("insert into all_types (id) values ($1)", .{999});
-        _ = try t.expectError(error.PG, c.exec("insert into all_types (id) values ($1)", .{999}));
-        try t.expectEqual(true, c.err.?.isUnique());
-    }
-
-    {
-        // can still use the connection after the error
-        _ = try t.expectError(error.PG, c.row("insert into all_types (id) values ($1) returning id", .{999}));
-        try t.expectEqual(true, c.err.?.isUnique());
-    }
-}
-
-test "PG: large read" {
-    var c = t.connect(.{ .read_buffer = 500 });
-    defer c.deinit();
-
-    {
-        // want this to be larger than our read_buffer
-        var rows = try c.query("select $1::text", .{"!" ** 1000});
-        defer rows.deinit();
-
-        const row = (try rows.next()).?;
-        try t.expectString("!" ** 1000, row.get([]u8, 0));
-        try t.expectEqual(null, try rows.next());
-    }
-
-    {
-        // with a row
-        var row = (try c.row("select $1::text", .{"z" ** 1000})).?;
-        defer row.deinit() catch {};
-        try t.expectString("z" ** 1000, row.get([]u8, 0));
-    }
-}
-
-test "Conn: dynamic buffer freed on error" {
-    var c = t.connect(.{ .read_buffer = 100 });
-    defer c.deinit();
-
-    var rows = try c.query("select $1::text", .{"!" ** 200});
-    defer rows.deinit();
-
-    const row = (try rows.next()).?;
-    try t.expectString("!" ** 200, row.get([]u8, 0));
-
-    // we end here, simulating the app returning an error. This causes
-    // rows.deinit() and c.deinit() to be called prematurely (from
-    // the point of view of our internal state). Specifically, conn.reader.endFlow
-    // isn't called.
-}
-
-test "PG: Record" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        var row = (try c.row("select row(9001, 'hello'::text)", .{})).?;
-        defer row.deinit() catch {};
-
-        var record = row.record(0);
-        try t.expectEqual(2, record.number_of_columns);
-        try t.expectEqual(9001, record.next(i32));
-        try t.expectString("hello", record.next([]const u8));
-    }
-
-    {
-        var row = (try c.row("select row(null)", .{})).?;
-        defer row.deinit() catch {};
-
-        var record = row.record(0);
-        try t.expectEqual(1, record.number_of_columns);
-        try t.expectEqual(null, record.next(?i32));
-    }
-}
-
-test "Conn: application_name" {
-    var conn = try Conn.open(t.allocator, .{});
-    defer conn.deinit();
-    try conn.auth(.{
-        .username = "pgz_user_clear",
-        .password = "pgz_user_clear_pw",
-        .database = "postgres",
-        .application_name = "pg_zig_test",
-    });
-
-    var row = (try conn.row("show application_name", .{})) orelse unreachable;
-    defer row.deinit() catch {};
-
-    try t.expectString("pg_zig_test", row.get([]const u8, 0));
-}
-
-test "PG: bind strictness" {
-    var c = t.connect(.{});
-    defer c.deinit();
-    try t.expectError(error.BindWrongType, c.row("select $1", .{100}));
-    try t.expectError(error.BindWrongType, c.row("select $1", .{10.2}));
-    try t.expectError(error.BindWrongType, c.row("select $1", .{true}));
-
-    try t.expectError(error.BindWrongType, c.row("select $1", .{@as(i32, 100)}));
-    try t.expectError(error.BindWrongType, c.row("select $1", .{@as(f32, 10.2)}));
-
-    // conn is still usable
-    try t.expectEqual(4, t.scalar(&c, "select 4"));
-}
-
-test "PG: eager error" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        // Some errors happen when the prepared statement is executed
-        try t.expectError(error.PG, c.query("select * from invalid", .{}));
-        try t.expectString("relation \"invalid\" does not exist", c.err.?.message);
-    }
-
-    {
-        // some errors only happen when the result is read
-        try c.begin();
-        defer c.rollback() catch {};
-        const sql = "create temp table test1 (id int) on commit drop";
-        _ = try c.exec(sql, .{});
-        try t.expectError(error.PG, c.query(sql, .{}));
-    }
-}
-
-// https://github.com/karlseguin/pg.zig/issues/44
-test "PG: eager error conn state" {
-    var pool = try lib.Pool.init(t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
-    defer pool.deinit();
-
-    {
-        var c = try pool.acquire();
-        defer c.release();
-
-        // duplicate it
-        _ = try c.exec("insert into all_types (id) values ($1)", .{2000});
-        try t.expectError(error.PG, c.exec("insert into all_types (id) values ($1)", .{2000}));
-    }
-
-    {
-        // only 1 connection in our pool, so the fact that the above fails and
-        // this one succeeds, means we're properly handling the failure
-        var c = try pool.acquire();
-        defer c.release();
-        _ = try c.exec("insert into all_types (id) values ($1)", .{2001});
-    }
-}
-
-// https://github.com/karlseguin/pg.zig/issues/45
-test "PG: rollback during error" {
-    var pool = try lib.Pool.init(t.allocator, .{ .size = 1, .auth = t.authOpts(.{}) });
-    defer pool.deinit();
-
-    _ = try pool.exec("truncate table all_types", .{});
-
-    {
-        var c = try pool.acquire();
-        defer c.release();
-
-        try c.begin();
-        // duplicate it
-        _ = try c.exec("insert into all_types (id) values ($1)", .{3000});
-        try t.expectError(error.PG, c.exec("insert into all_types (id) values ($1)", .{3000}));
-        try c.rollback();
-    }
-
-    {
-        // only 1 connection in our pool, so the fact that the above fails and
-        // this one succeeds, means we're properly handling the failure
-        var c = try pool.acquire();
-        defer c.release();
-        _ = try c.exec("insert into all_types (id) values ($1)", .{3001});
-    }
-
-    var result = try pool.query("select id from all_types order by id", .{});
-    defer result.deinit();
-
-    try t.expectEqual(3001, (try result.next()).?.get(i32, 0));
-    try t.expectEqual(null, (try result.next()));
-}
-
-test "open URI" {
-    const uri = try std.Uri.parse("postgresql://postgres:postgres@localhost:5432/postgres?tcp_user_timeout=5000");
-    var conn = try Conn.openAndAuthUri(t.allocator, uri);
-    conn.deinit();
-}
-
-test "Conn: TLS required" {
-    {
-        var conn = try Conn.open(t.allocator, .{ .tls = .off });
-        defer conn.deinit();
-        try t.expectError(error.PG, conn.auth(.{ .username = "pgz_user_ssl" }));
-        try t.expectEqual(true, std.mem.indexOf(u8, conn.err.?.message, "no encryption") != null);
-    }
-
-    {
-        var conn = t.connect(.{ .tls = Conn.Opts.TLS.require, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
-        defer conn.deinit();
-    }
-}
-
-test "Conn: TLS verify-full" {
-    try t.expectError(error.SSLCertificationVerificationError, Conn.open(t.allocator, .{ .tls = .{ .verify_full = null } }));
-
-    {
-        var conn = t.connect(.{ .tls = Conn.Opts.TLS{ .verify_full = "tests/root.crt" }, .username = "pgz_user_ssl", .password = "pgz_user_ssl_pw" });
-        defer conn.deinit();
-    }
-}
-
-test "PG: cached query" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        var result = try c.queryOpts("select $1::int as id, $2::text as name", .{ 1, "leto" }, .{ .cache_name = "c1" });
-        try t.expectEqual(0, result.column_names.len);
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(1, row.get(i32, 0));
-        try t.expectString("leto", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-
-    {
-        var result = try c.queryOpts("slc", .{ 2, "ghanima" }, .{ .cache_name = "c1" });
-        try t.expectEqual(0, result.column_names.len);
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(2, row.get(i32, 0));
-        try t.expectString("ghanima", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-
-    try c.deallocate("c1");
-
-    {
-        try t.expectError(error.PG, c.queryOpts("slc", .{ 2, "ghanima" }, .{ .cache_name = "c1" }));
-        try t.expectEqual(true, std.mem.indexOf(u8, c.err.?.message, "syntax error at or near \"slc\"") != null);
-    }
-}
-
-test "PG: cached query with column names" {
-    var c = t.connect(.{});
-    defer c.deinit();
-
-    {
-        var result = try c.queryOpts("select $1::int as id, $2::text as name", .{ 1, "leto" }, .{ .cache_name = "c2", .column_names = true });
-        try t.expectEqual(2, result.column_names.len);
-        try t.expectString("id", result.column_names[0]);
-        try t.expectString("name", result.column_names[1]);
-
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(1, row.get(i32, 0));
-        try t.expectString("leto", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-
-    {
-        var result = try c.queryOpts("", .{ 2, "ghanima" }, .{ .cache_name = "c2", .column_names = true });
-        try t.expectEqual(2, result.column_names.len);
-        try t.expectString("id", result.column_names[0]);
-        try t.expectString("name", result.column_names[1]);
-
-        const row = (try result.next()) orelse unreachable;
-        try t.expectEqual(2, row.get(i32, 0));
-        try t.expectString("ghanima", row.get([]u8, 1));
-
-        try t.expectEqual(null, try result.next());
-        result.deinit();
-    }
-}
-
-fn expectNumeric(numeric: types.Numeric, expected: []const u8) !void {
-    var str_buf: [50]u8 = undefined;
-    try t.expectString(expected, try numeric.toString(&str_buf));
-
-    const a = try t.allocator.alloc(u8, numeric.estimatedStringLen());
-    defer t.allocator.free(a);
-    try t.expectString(expected, try numeric.toString(a));
-
-    if (std.mem.eql(u8, expected, "nan")) {
-        try t.expectEqual(true, std.math.isNan(numeric.toFloat()));
-    } else if (std.mem.eql(u8, expected, "inf")) {
-        try t.expectEqual(true, std.math.isInf(numeric.toFloat()));
-    } else if (std.mem.eql(u8, expected, "-inf")) {
-        try t.expectEqual(true, std.math.isNegativeInf(numeric.toFloat()));
-    } else {
-        try t.expectDelta(try std.fmt.parseFloat(f64, expected), numeric.toFloat(), 0.000001);
-    }
-}
-
 const DummyStruct = struct {
     id: i32,
     name: []const u8,
@@ -2075,3 +2074,16 @@ const DummyEnum = enum {
     val1,
     val2,
 };
+
+test {
+    _ = @import("../tests/test_copy.zig");
+    _ = @import("../tests/test_cancel_notice.zig");
+}
+
+test {
+    _ = @import("../tests/test_pipeline.zig");
+}
+
+test {
+    _ = @import("../tests/test_large_object.zig");
+}

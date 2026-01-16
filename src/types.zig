@@ -1548,3 +1548,29 @@ test "UUID: toBytes" {
         try t.expectSlice(u8, &.{ 22, 107, 71, 81, 215, 2, 79, 185, 154, 42, 205, 107, 105, 237, 24, 215 }, &s);
     }
 }
+
+pub fn inferOid(comptime T: type) i32 {
+    return switch (@typeInfo(T)) {
+        .bool => Bool.oid.decimal,
+        .int => |info| switch (info.bits) {
+            16 => Int16.oid.decimal,
+            32 => Int32.oid.decimal,
+            64 => Int64.oid.decimal,
+            else => @compileError("Unsupported int size for inference"),
+        },
+        .float => |info| switch (info.bits) {
+            32 => Float32.oid.decimal,
+            64 => Float64.oid.decimal,
+            else => @compileError("Unsupported float size for inference"),
+        },
+        .pointer => |ptr| switch (ptr.size) {
+            .slice => switch (ptr.child) {
+                u8 => String.oid.decimal,
+                else => @compileError("Unsupported slice type for inference"),
+            },
+            else => @compileError("Unsupported pointer type for inference"),
+        },
+        .optional => |opt| inferOid(opt.child),
+        else => @compileError("Unsupported type for inference: " ++ @typeName(T)),
+    };
+}
